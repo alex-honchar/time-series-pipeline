@@ -1,59 +1,55 @@
 # QUICK_TOUR
 
-This is a short guide to the current codebase (what runs today, and where to look).
+This guide explains the codebase structure and the data flow mechanics.
 
-## Project at a glance
+## System Overview
 
-Right now the project is a minimal **streaming pipeline**:
+The project is a low-latency **streaming pipeline** designed for sequential trade processing:
 
-- read a prepared `merged.jsonl.gz` stream **tick-by-tick**
-- **1 line = 1 second tick**
-- parse JSON
-- if the tick is marked as connected → push its trades into a rolling `deque`
-
----
-
-## Repo layout
-
-- `run.py`  
-  Entry point. Starts the loop and calls `ingest_tick()` until the stream ends.
-
-- `state.py`  
-  Shared runtime state (system flags, counters, rolling trade buffer).
-
-- `ingest/stream_reader.py`  
-  Streaming reader: decompression, JSON parsing, basic validation, buffering trades.
-
-- `preprocess/merge_raw_data.py`  
-  One-time utility that merges raw dump files into the optimized `merged.jsonl.gz` format.
+- **Input:** A pre-aggregated `merged.jsonl.gz` stream.
+- **Resolution:** 1 line = 1 second (tick).
+- **Process:** sequential read → parse → validate → push to memory.
+- **Storage:** Valid ticks are stored in a rolling `deque` for immediate statistical analysis.
 
 ---
 
-## 1) One-time data preparation
+## File Structure
 
-### `preprocess/merge_raw_data.py`
+- `ingest/preprocess/merge_raw_data.py`
+  Normalization utility. Converts raw dumps into the optimized compact list format.
 
-This script is **not part of the runtime pipeline**.  
-It is a one-time tool to convert raw dump files into a single normalized stream.
+- `constants.py`
+  Index mapping. Defines integer constants (`TS=0`, `PRICE=1`, etc.) for accessing elements in the raw list format.
 
-- input: many raw `*.jsonl.gz` files from `INPUT_DIR`
-- output: one file `merged.jsonl.gz` in `OUTPUT_DIR`
+- `state.py`
+  Shared runtime context. Stores system flags, performance metrics, and the rolling trade buffer.
 
-Normalized output format (one line / one tick):
+- `ingest/stream_reader.py`
+  Core ingestion logic. Reads the compressed stream, validates ticks, and updates the market buffer.
+
+- `run.py`
+  Entry point. Initializes the environment and drives the main ingestion loop.
+---
+
+## 1) Data Preparation
+
+### `ingest/preprocess/merge_raw_data.py`
+
+This is a **one-time utility** to normalize raw exchange dumps into a fast-loading stream format.
+
+- **Input:** Multiple raw `*.jsonl.gz` files from `INPUT_DIR`.
+- **Output:** A single chronologically sorted `merged.jsonl.gz`.
+
+**Transformation Logic (per second):**
+1.  **Aggregation:** Sums `buy_volume` and `sell_volume` separately.
+2.  **Forward Fill:** Carries over the last known price to empty ticks to avoid gaps.
+3.  **Serialization:** Converts dicts to a compact list format.
+
+**Output Format:**
+`[ts, price, buy_vol, sell_vol, count, is_connected]`
 
 ```json
-{
-  "true_ts": 1767916543589,
-  "is_connected": true,
-  "data": [
-    {
-      "trade_ts": 1767916542795,
-      "price": 91106.09,
-      "volume": 0.00054,
-      "is_buyer_maker": true
-    }
-  ]
-}
+[1767916543589, 91106.09, 0.54, 0.12, 15, true]
 ```
 
 
@@ -75,63 +71,57 @@ Normalized output format (one line / one tick):
   - `disconnected_ticks`: ticks where `is_connected = false`
 
 - `market`
-  - `trades`: rolling buffer of recent trades (`deque(maxlen=10000)`)
-  - `last_price`: placeholder for later logic
-
+  - `trades`: rolling buffer of recent trades (`deque`, stores compact lists `[ts, price, vol...]`)
+  - `last_price`: placeholder for later logic (current market price)
 
 ## 3) Ingestion (stream reader)
 
 ### `ingest/stream_reader.py`
 
-This module streams `merged.jsonl.gz` sequentially and updates the rolling trade buffer in
-`state["market"]["trades"]` (connected ticks only).
+This module streams `merged.jsonl.gz` sequentially and updates the rolling trade buffer in `state["market"]["trades"]`.
 
 Main functions:
 
 - `init_reader(state)`
-  - opens the `merged.jsonl.gz` stream and starts the timer
-  - uses `pigz` if available, otherwise falls back to Python `gzip`
-  - enables the main loop (`system["active"] = True`)
+  - opens the stream using `pigz` (subprocess) or standard `gzip`
+  - sets `system["start_time"]` and enables the main loop
 
-- `read_tick(state) -> dict | None`
-  - reads the next JSON line (one tick = one second)
-  - returns the parsed tick dict, or `None` on EOF / parse failure
+- `read_tick(state) -> list | None`
+  - reads raw bytes and parses JSON via `orjson`
+  - returns the raw list `[ts, price, b_vol, s_vol, count, connected]`
   - increments `metrics["broken_ticks"]` on parse errors
 
 - `check_tick(state, tick)`
-  - increments `system["tick"]`
-  - sets `system["tick_connected"]` from `tick["is_connected"]`
-  - increments `metrics["disconnected_ticks"]` when the tick is not connected
-  - prints a simple throughput report every 86400 ticks
+  - updates global counters and prints throughput (LPS) every 86,400 ticks
+  - updates `system["tick_connected"]` based on index `[5]` (`CONNECTED`)
 
 - `push_tick(state, tick)`
-  - appends `tick["data"]` to the rolling trade buffer (`market["trades"]`)
+  - slices the input list `tick[:5]` to isolate `[TS, PRICE, BUY_VOL, SELL_VOL, COUNT]`
+  - appends the compact list to `state["market"]["trades"]`
 
 - `ingest_tick(state)`
-  - single-step ingestion: `read_tick → check_tick → push_tick` (connected ticks only)
-
-
+  - calls `read_tick` → `check_tick` → `push_tick` (only if connected)
 
 
 ## 4) Runner loop
 
 ### `run.py`
 
-`run.py` is intentionally small and just drives the ingestion loop:
+Entry point script. It initializes the reader and executes the main event loop.
 
-- `init_reader(state)`
-- `while state["system"]["active"]:`
-  - `ingest_tick(state)`
+**Execution flow:**
+- `init_reader(state)`: Sets up the subprocess pipe and timers.
+- `while state["system"]["active"]`:
+  - `ingest_tick(state)`: Processes one tick (read → check → push).
 
-Later pipeline steps (snapshots, statistics, inference, visualization) will be added after ingestion in the same loop.
+*The loop runs until EOF or a fatal stream error.*
 
+## 5) Current Status
 
-## 5) Current behavior
+The pipeline currently functions as a high-speed ingestion engine.
 
-What you can run and observe right now:
-
-- sequential reading of a compressed tick stream (`jsonl.gz`)
-- 1 line = 1 second tick
-- rolling buffering of recent trades in `market.trades`
-- basic counters for broken JSON ticks and disconnected ticks
-- simple performance logging (lines per second)
+**Operational details:**
+- **Input:** Streams compressed `jsonl.gz` via `pigz` pipe.
+- **Performance:** High-speed sequential processing.
+- **State:** Maintains a rolling buffer of compact trade lists (`[ts, price, b_vol, s_vol, count]`).
+- **Logging:** Prints throughput metrics every 86,400 ticks; prints validation counters on completion.

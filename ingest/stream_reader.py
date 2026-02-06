@@ -3,6 +3,8 @@ import orjson
 import time
 import subprocess
 
+from constants import TS, PRICE, BUY_VOL, SELL_VOL, COUNT, CONNECTED
+
 def init_reader(state):
     if state["system"]["start_time"] is None:
         state["system"]["start_time"] = time.time() # used for simple throughput logging
@@ -42,7 +44,7 @@ def check_tick(state, line):
         time_diff = real_time - state["system"]["start_time"]
         print(f'lps = {state["system"]["tick"] / time_diff}     /       total time = {time_diff}')
 
-    if line["is_connected"] is True:
+    if line[CONNECTED] is True:
         state["system"]["tick_connected"] = True # tick_connected is a run-validity flag: only clean continuous segments are allowed to update stats
     else:
         state["system"]["tick_connected"] = False
@@ -50,8 +52,7 @@ def check_tick(state, line):
 
 
 def push_tick(state, line): 
-    trade_list = line["data"]
-    state["market"]["trades"].extend(trade_list)
+    state["market"]["trades"].append(line[:5])
 
 def ingest_tick(state):
     line = read_tick(state)
