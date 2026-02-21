@@ -1,6 +1,0 @@
-TS = 0
-PRICE = 1
-BUY_VOL = 2
-SELL_VOL = 3
-COUNT = 4
-CONNECTED = 5
