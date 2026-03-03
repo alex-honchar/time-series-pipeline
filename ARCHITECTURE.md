@@ -1,8 +1,8 @@
 # Pipeline Architecture
 
-This document describes the internal mechanics of the data preparation and orchestration pipeline.
+This document describes the internal mechanics of the data preparation and execution pipeline.
 
-The system transforms raw, unordered CSV dumps into a compact binary format and distributes work across parallel workers with deterministic boundaries. All core modules reside in the `pipeline/` directory.
+The system transforms raw, unordered CSV dumps into a compact binary format and supports shared-memory worker execution with deterministic boundaries. Data preparation and planning modules reside in the `pipeline/` directory, while the execution runner and core math logic sit at the root level.
 
 ## 1. Sorter (`pipeline/sorter.py`)
 
@@ -29,7 +29,7 @@ That breaks sequential processing and rolling logic.
 - **Gap Detection:** Missing ranges exceeding a threshold (e.g., `GAP_THRESHOLD_SEC = 15`) are stored as gap metadata (`[gap_start, gap_end]`) in the file
 - **Header Write:** Prepends a fixed-size binary header with file metadata
 
-**Important:** The packer keeps a full per-second timeline. Micro-gaps (under 15s) are smoothly forward-filled, while significant dropouts are explicitly recorded as metadata so downstream logic can accurately distinguish `VALID` vs `INVALID` ranges.
+**Important:** The packer keeps a full per-second timeline. Micro-gaps (under 15s) are forward-filled with the last known price, while significant dropouts are explicitly recorded as metadata so downstream logic can accurately distinguish `VALID` vs `INVALID` ranges.
 
 ### Binary layout (current)
 1. **Header** (64 bytes)
@@ -49,51 +49,109 @@ That breaks sequential processing and rolling logic.
 
 ---
 
-## 3. Orchestrator (`pipeline/orchestrator.py`)
+## 3. Execution Planner (`pipeline/execution_planner.py`)
 
-**Goal:** Build deterministic worker jobs for parallel time simulation using only binary metadata (headers + gaps), without reading the payload.
+**Goal:** Assemble a contiguous buffer of valid tick data and an execution plan from fragmented binary files.
 
 ### The Core Problem: Files vs. Timeline
-Data is stored as physical files, but rolling logic requires a continuous logical timeline.  
-The orchestrator must split a global timeline into worker chunks, then convert them back into physical file offsets.
 
-Every worker needs:
-- **`skip`**: advance the file cursor
-- **`warmup`**: prime the internal state (no evaluation)
-- **`do`**: actual evaluation range
+Data is stored in separate `.bin` files, but rolling logic needs a continuous timeline.  
+The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to file offsets with warmup-aware boundaries. 
 
-To achieve this, the orchestrator must:
-- Map a global timeline of `VALID`/`INVALID` segments back to specific `.bin` files.
-- Guarantee every `do` segment has a full `warmup` history.
-- Stitch boundaries when a worker's `warmup` requirement spans across multiple files.
-- Reset `warmup` expectations whenever an `INVALID` gap breaks the timeline.
+It skips `INVALID` gaps, using them to trigger warmup resets for the next `VALID` segment, and emits execution entries in the form:
+
+`[cursor, timestamp, warmup_ticks, active_ticks]`
 
 ### Input
+
 From each `.bin` file:
-- Time bounds (from the 64-byte header)
-- Gap metadata (`INVALID` ranges)
+
+* Time bounds from the binary header
+* Gap metadata describing `INVALID` ranges
 
 ### Output
-Job lists for `MAX_WORKERS` in this format:  
-`[file_name, skip, warmup, do]`
+
+The execution planner returns two values:
+
+* **`assembled_ticks`**: a contiguous `int32` NumPy array with the valid tick data required for execution
+* **`execution_plan`**: a list of entries in this format:
+  `[cursor, timestamp, warmup_ticks, active_ticks]`
+
+Each execution-plan entry refers to a slice of the assembled tick buffer.
 
 ### Execution Flow
-1. **Timeline Reconstruction:** Builds a global `VALID` / `INVALID` timeline from file metadata (headers + gaps).
-2. **Chunk Allocation:** Divides the global timeline into roughly equal worker chunks (`base_chunk`, in ticks).
-3. **Job Resolution:** Converts abstract chunks into specific `skip / warmup / do` file boundaries, including warmup stitching across worker boundaries.
+
+1. **File Scan:** Read binary headers and gap metadata from eligible `.bin` files.
+2. **Timeline Fragmentation:** Convert file-local gaps into `VALID` / `INVALID` timeline segments.
+3. **Segment Coalescing:** Merge adjacent segments of the same type.
+4. **File Alignment:** Convert file spans into relative tick intervals within the global timeline.
+5. **Segment Mapping:** Resolve warmup and active coverage against physical file boundaries.
+6. **Validation:** Check that mapped volume matches expected valid coverage.
+7. **Payload Assembly:** Read the required tick ranges into one contiguous array and build the execution plan.
 
 ### Validation (Current)
-A global mathematical check at the end of execution:
-- Verifies `SUM(warmup + do) == TOTAL_VALID + (WARMUP * (MAX_WORKERS - 1))`
-- Confirms global processed volume is consistent (including duplicated warmup across worker boundaries)
+
+A global volume check confirms that:
+
+* all valid ticks are either assigned to execution or counted as lost warmup coverage,
+* the assembled payload volume matches the mapped timeline.
 
 ### Guarantees
-- Deterministic worker boundaries across runs
-- No `do` execution without contiguous `warmup` history
-- `warmup` resets after invalid segments
+
+* No active segment is emitted without contiguous warmup history
+* Warmup resets after invalid timeline gaps
+* Output is deterministic for the same binary input set
 
 ---
 
-## 4. Planned
-- **Per-worker validation:** Independent checks for worker-level coverage (expected `VALID` ticks vs. assigned `warmup/do`)
-- **Worker execution:** Implement the engine that consumes `[skip, warmup, do]` jobs
+## 4. Backtest Runner (`backtest_runner.py`)
+
+**Goal:** Run backtest segments over a shared tick buffer.
+
+### The Core Problem: Shared Data vs. Segment Execution
+
+The execution planner produces a contiguous tick buffer and an execution plan, but the simulation still has to process each segment with warmup and active logic. The runner sets up shared memory for the assembled tick buffer and executes the plan through worker processes.
+
+### Mechanics
+* **Planning:** Calls the `ExecutionPlanner` to get `assembled_ticks` and `execution_plan`.
+* **Shared Memory:** Creates a shared-memory block for `assembled_ticks` and exposes it to workers through NumPy views.
+* **Worker Initialization:** Each worker attaches to the shared-memory block by name and stores the shared execution plan.
+* **Execution Loop:**
+    1. Slice `ticks_view` into `warmup_part` and `active_part` using offsets from the plan.
+    2. Run `do_warmup` to initialize EMA and variance state.
+    3. Run `do_active` to process the active segment and return the final tick's z-score bins.
+
+### Current State
+* The multiprocessing structure is in place, but current runs are still minimal (`range(1)`).
+* Every worker currently iterates over the full `execution_plan`.
+* Shared memory is used so the assembled tick buffer is not copied into each worker process.
+
+### Guarantees
+* All workers read from the same assembled tick buffer.
+* Warmup and active processing follow the execution plan emitted by the execution planner.
+* Shared memory is explicitly closed and unlinked during cleanup.
+
+---
+
+## 5. Segment Math (`segment_math.py`)
+
+**Goal:** Run warmup and active calculations for each execution segment.
+
+### Logic
+* **`do_warmup`**: Initialize EMA and variance state from the warmup segment.
+* **`do_active`**: Process the active segment tick-by-tick, update rolling state, and return discretized z-score bins for the final tick only.
+
+### Implementation
+* Core math is compiled with Numba (`njit`).
+* EMA and variance are updated tick-by-tick.
+* Z-scores are scaled and shifted into a fixed integer range (`0-60`).
+
+### Rules
+* Ticks must be processed in chronological order.
+* Warmup must run before active evaluation.
+
+---
+
+## Planned
+- Writing results to the shared `stats` array
+- Core math optimization

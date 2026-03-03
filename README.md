@@ -1,64 +1,69 @@
 # Time-Series Simulation Pipeline (WIP)
 
-Portfolio engineering project for deterministic preprocessing and orchestration of time-based data in Python.
+Portfolio engineering project for deterministic preprocessing and execution of time-based data in Python.
 
-The pipeline converts raw event rows (CSV dumps) into a compact binary format and prepares gap-aware worker jobs for fast sequential simulation and parallel evaluation.
+The pipeline converts raw event rows (CSV dumps) into a compact binary format, assembles a contiguous tick buffer, and builds a gap-aware execution plan for sequential simulation and worker-based execution.
 
-Detailed module breakdown and data flow:
-- see `ARCHITECTURE.md`
+Detailed module breakdown and data flow: see `ARCHITECTURE.md`.
 
 ---
 
 ## Pipeline Structure
-The core engine is located in the `pipeline/` directory.
 
-### 1) Preprocessing (`sorter.py`)
+Data preparation and planning modules reside in the `pipeline/` directory, while the execution runner and core math logic sit at the root level.
+
+### 1) Preprocessing (`pipeline/sorter.py`)
 Raw source CSVs are sorted by timestamp.
 
-This step exists because Binance monthly dumps may contain rows out of chronological order.
+This step exists because exchange dumps (e.g. Binance monthly CSVs) may contain rows out of chronological order.
 
-### 2) Binary Packer (`binary_packer.py`)
+### 2) Binary Packer (`pipeline/binary_packer.py`)
 Converts raw time-based rows into a custom binary format.
 
 The packer:
 - normalizes input into a strict 1-second timeline
 - expands each month to its full second range
-- stores missing ranges as explicit gap metadata
+- stores missing ranges explicitly as gap metadata
 
-### 3) Orchestrator (`orchestrator.py`)
-Builds gap-aware worker jobs from binary metadata.
+### 3) Execution Planner (`pipeline/execution_planner.py`)
+Builds a contiguous tick buffer and a gap-aware execution plan from binary metadata.
 
-It rebuilds `VALID` / `INVALID` segments and generates per-worker boundaries:
-- `skip`
-- `warmup`
-- `do`
+It skips missing data gaps, using them to force a state reset and a new warmup phase for the next valid segment. It emits execution entries in the form:
 
-`warmup` exists so rolling-window logic starts only after enough valid contiguous history is available.
+`[cursor, timestamp, warmup_ticks, active_ticks]`
 
-This ensures correct worker boundaries for rolling logic and sequential time simulation.
+### 4) Backtest Execution (`backtest_runner.py` & `segment_math.py`)
+Runs the generated execution plan over the assembled tick buffer.
+
+- **Memory:** Uses `multiprocessing.shared_memory` so the assembled tick buffer is not copied into each worker process.
+- **Math:** Uses Numba-compiled functions for warmup and active segment calculations, including rolling EMA / variance updates and z-score discretization.
 
 ---
 
-## Data (current setup)
+## Data (Current Setup)
 
 - Binance BTCUSDT trade dumps
 - 1-second internal resolution
-- local dataset (not tracked in git)
+- Local dataset (not tracked in git)
 
 ---
 
 ## Status
 
-Implemented:
-- strict CSV sorting
-- custom binary packer
-- gap-aware orchestrator
-- global mathematical validation (sanity checks)
+**Implemented:**
+- Strict CSV sorting
+- Gap-aware binary packer
+- Execution planner with gap skipping and warmup resets
+- Global volume validation
+- Shared-memory worker execution
+- Numba-compiled segment math (`do_warmup`, `do_active`)
 
-Planned:
-- per-worker invariant validation
-- worker execution engine
+**Planned:**
+- Writing results to the shared `stats` array
+- Core math optimization
 
 ---
 
-Tech: Python 3.x, `struct`, `concurrent.futures`, `pandas` (preprocessing only).
+## Tech Stack
+
+Python 3.x, `numpy`, `numba`, `multiprocessing.shared_memory`, `struct`, `concurrent.futures`, `pandas` (preprocessing only).
