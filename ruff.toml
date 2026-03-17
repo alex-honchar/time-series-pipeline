@@ -1,10 +1,10 @@
 [lint]
 select = [
-    "E",   # pycodestyle (ошибки)
-    "W",   # pycodestyle (варнинги)
-    "F",   # Pyflakes
-    "I",   # isort (импорты)
-    "B",   # flake8-bugbear (логические косяки)
-    "ANN", # flake8-annotations (типы!)
-    "D",   # pydocstyle (докстринги)
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "ANN",
+    "D",
 ]

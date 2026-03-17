@@ -18,7 +18,7 @@ TIMESTAMP_RULES = [
     (10**9, 1)
 ]
 
-class Etl:
+class BinaryPackerJob:
     """Process one monthly Binance CSV file into a binary output."""
 
     __slots__ = [
@@ -165,9 +165,9 @@ class Etl:
             writer.write(self.buffer)
 
 
-def task(path: Path) -> None:
+def pack_file(path: Path) -> None:
     """Convert one CSV file to binary format."""
-    etl = Etl(path)
+    etl = BinaryPackerJob(path)
     etl.run()
 
 if __name__ == "__main__":
@@ -178,7 +178,7 @@ if __name__ == "__main__":
     ) as executor:
 
         futures = {
-            executor.submit(task, path): path
+            executor.submit(pack_file, path): path
             for path in input_files
         }
 

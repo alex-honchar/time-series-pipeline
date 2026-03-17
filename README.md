@@ -1,8 +1,8 @@
-# Time-Series Simulation Pipeline (WIP)
+# Time-Series Simulation Pipeline
 
-Portfolio engineering project for deterministic preprocessing and execution of time-based data in Python.
+Portfolio engineering project for deterministic preprocessing, simulation, and visualization of time-based data in Python.
 
-The pipeline converts raw event rows (CSV dumps) into a compact binary format, assembles a contiguous tick buffer, and builds a gap-aware execution plan for sequential simulation and worker-based execution.
+The pipeline converts raw event rows (CSV dumps) into a compact binary format, assembles a contiguous valid tick buffer, and builds a gap-aware execution plan for sequential simulation.
 
 Detailed module breakdown and data flow: see `ARCHITECTURE.md`.
 
@@ -10,7 +10,7 @@ Detailed module breakdown and data flow: see `ARCHITECTURE.md`.
 
 ## Pipeline Structure
 
-Data preparation and planning modules reside in the `pipeline/` directory, while the execution runner and core math logic sit at the root level.
+Data preparation and planning modules reside in `pipeline/`, simulation logic in `simulation/`, and rendering logic in `visualization/`.
 
 ### 1) Preprocessing (`pipeline/sorter.py`)
 Raw source CSVs are sorted by timestamp.
@@ -28,15 +28,33 @@ The packer:
 ### 3) Execution Planner (`pipeline/execution_planner.py`)
 Builds a contiguous tick buffer and a gap-aware execution plan from binary metadata.
 
-It skips missing data gaps, using them to force a state reset and a new warmup phase for the next valid segment. It emits execution entries in the form:
+It skips missing data gaps, uses them to trigger warmup resets for the next valid segment, and emits execution entries in the form:
 
 `[cursor, timestamp, warmup_ticks, active_ticks]`
 
-### 4) Backtest Execution (`backtest_runner.py` & `segment_math.py`)
-Runs the generated execution plan over the assembled tick buffer.
+### 4) Backtest Runner (`simulation/backtest_runner.py`)
+Executes the generated plan over the assembled tick buffer.
 
-- **Memory:** Uses `multiprocessing.shared_memory` so the assembled tick buffer is not copied into each worker process.
-- **Math:** Uses Numba-compiled functions for warmup and active segment calculations, including rolling EMA / variance updates and z-score discretization.
+- restores warmup state for each segment
+- updates `stats` across the execution plan
+- routes the final segment through capture and rendering
+- uses `multiprocessing.shared_memory` for the assembled tick buffer
+
+### 5) Segment Processing (`simulation/passive.py`, `simulation/capture.py`)
+Runs the core per-segment math.
+
+- **Passive mode:** updates the 4D `stats` matrix without rendering overhead
+- **Capture mode:** reuses the same sequential processing flow, adds weight-matrix updates, and traps frame data for rendering
+- **Math:** uses Numba-compiled functions for warmup, EMA / variance updates, Z-score discretization, and ring-buffer-based delayed price tracking
+
+### 6) Visualization (`visualization/visualize.py`)
+Renders captured 2D matrices into MP4 heatmaps.
+
+- normalizes captured 2D matrices
+- resizes them into a fixed video canvas
+- applies OpenCV color mapping
+- draws axes, timestamps, and realized price paths
+- writes the result as an MP4 file
 
 ---
 
@@ -55,15 +73,16 @@ Runs the generated execution plan over the assembled tick buffer.
 - Gap-aware binary packer
 - Execution planner with gap skipping and warmup resets
 - Global volume validation
-- Shared-memory worker execution
-- Numba-compiled segment math (`do_warmup`, `do_active`)
+- Shared-memory execution scaffolding
+- Passive segment processing with 4D `stats` updates
+- Capture mode with frame trapping
+- MP4 heatmap rendering via OpenCV
 
 **Planned:**
-- Writing results to the shared `stats` array
 - Core math optimization
 
 ---
 
 ## Tech Stack
 
-Python 3.x, `numpy`, `numba`, `multiprocessing.shared_memory`, `struct`, `concurrent.futures`, `pandas` (preprocessing only).
+Python 3.x, `numpy`, `numba`, `multiprocessing.shared_memory`, `struct`, `concurrent.futures`, `pandas` (preprocessing only), `opencv-python`

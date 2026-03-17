@@ -13,7 +13,6 @@ cfg = Config()
 def sort_file(path: Path) -> None:
     """Sort trade data files by timestamp."""
     symbol, data_type, year, month = path.stem.split("-")
-    print(f"LETS START {path}")
 
     output_path = (
         cfg.ROOT / f"{symbol}-Sorted" / f"{symbol}-{data_type}Sorted-{year}-{month}.csv"

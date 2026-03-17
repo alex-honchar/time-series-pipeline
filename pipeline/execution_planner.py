@@ -30,11 +30,11 @@ class ExecutionPlanner:
     coalesced_segments: list[tuple[str,int]]
     mapped_file_chunks: list[tuple[Path, int, int, int]]
     total_valid_ticks: int
-    slost_valid: int
+    lost_valid: int
     gap_bytes_map: dict[Path, int]
 
     def __init__(self, input_path: Path) -> None:
-        """Initialize orchestator state."""
+        """Initialize execution planner state."""
         self.input_path = input_path
         self.file_spans = []
         self.aligned_files = []
@@ -46,7 +46,7 @@ class ExecutionPlanner:
         self.gap_bytes_map = {}
 
     def build(self) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
-        """Execute the full orchestrator pipeline."""
+        """Execute the full execution planner pipeline."""
         self._unpack_input_files()
         self._align_file_intervals()
         self._coalesce_segments()
@@ -78,7 +78,7 @@ class ExecutionPlanner:
                 if (
                     signature == b'0P00'
                     and version == 1
-                    and (cfg.START_YEAR <= year < cfg.WALK_FORWARD_YEAR)
+                    and (cfg.START_YEAR <= year < cfg.END_YEAR)
                 ):
                     self.file_spans.append((file, duration, start_ts, end_ts))
                     self.gap_bytes_map[file] = (gap_count*cfg.GAP_RECORD_BYTE_SIZE)
@@ -212,7 +212,6 @@ class ExecutionPlanner:
             actual_ticks += to_warmup_ticks + to_do_ticks
 
         tick_diff = expected_ticks - (actual_ticks + self.lost_valid_ticks)
-        print(f"diff = {tick_diff} / actual = {actual_ticks}")
         if tick_diff != 0:
             raise RuntimeError(f"Job volume mismatch: diff={tick_diff}")
 

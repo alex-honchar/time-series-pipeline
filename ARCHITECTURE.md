@@ -2,7 +2,7 @@
 
 This document describes the internal mechanics of the data preparation and execution pipeline.
 
-The system transforms raw, unordered CSV dumps into a compact binary format and supports shared-memory worker execution with deterministic boundaries. Data preparation and planning modules reside in the `pipeline/` directory, while the execution runner and core math logic sit at the root level.
+The system transforms raw, unordered CSV dumps into a compact binary format and executes deterministic, gap-aware simulations over assembled tick data. Data preparation and planning modules reside in the `pipeline/` directory, simulation logic in `simulation/`, and rendering logic in `visualization/`.
 
 ## 1. Sorter (`pipeline/sorter.py`)
 
@@ -25,7 +25,7 @@ That breaks sequential processing and rolling logic.
 **Mechanics:**
 - **Normalization:** Converts source timestamps to a strict 1-second timeline
 - **Month Expansion:** Expands each month to its full second range
-- **Binary Packing:** Packs per-second values into raw bytes via `struct` (e.g. `<i>`)
+- **Binary Packing:** Packs per-second values into bytes via `struct` (e.g. `<i>`)
 - **Gap Detection:** Missing ranges exceeding a threshold (e.g., `GAP_THRESHOLD_SEC = 15`) are stored as gap metadata (`[gap_start, gap_end]`) in the file
 - **Header Write:** Prepends a fixed-size binary header with file metadata
 
@@ -56,7 +56,9 @@ That breaks sequential processing and rolling logic.
 ### The Core Problem: Files vs. Timeline
 
 Data is stored in separate `.bin` files, but rolling logic needs a continuous timeline.  
-The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to file offsets with warmup-aware boundaries. 
+
+The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to physical file offsets with warmup-aware boundaries.
+
 
 It skips `INVALID` gaps, using them to trigger warmup resets for the next `VALID` segment, and emits execution entries in the form:
 
@@ -89,7 +91,7 @@ Each execution-plan entry refers to a slice of the assembled tick buffer.
 6. **Validation:** Check that mapped volume matches expected valid coverage.
 7. **Payload Assembly:** Read the required tick ranges into one contiguous array and build the execution plan.
 
-### Validation (Current)
+### Validation
 
 A global volume check confirms that:
 
@@ -104,54 +106,77 @@ A global volume check confirms that:
 
 ---
 
-## 4. Backtest Runner (`backtest_runner.py`)
+## 4. Backtest Runner (`simulation/backtest_runner.py`)
 
-**Goal:** Run backtest segments over a shared tick buffer.
+**Goal:** Execute the assembled tick buffer over the execution plan.
 
-### The Core Problem: Shared Data vs. Segment Execution
-
-The execution planner produces a contiguous tick buffer and an execution plan, but the simulation still has to process each segment with warmup and active logic. The runner sets up shared memory for the assembled tick buffer and executes the plan through worker processes.
+The runner takes `assembled_ticks` and `execution_plan` from the `ExecutionPlanner`, restores warmup state for each segment, updates the stats across the plan, and runs capture/rendering on the final segment.
 
 ### Mechanics
-* **Planning:** Calls the `ExecutionPlanner` to get `assembled_ticks` and `execution_plan`.
-* **Shared Memory:** Creates a shared-memory block for `assembled_ticks` and exposes it to workers through NumPy views.
-* **Worker Initialization:** Each worker attaches to the shared-memory block by name and stores the shared execution plan.
-* **Execution Loop:**
-    1. Slice `ticks_view` into `warmup_part` and `active_part` using offsets from the plan.
-    2. Run `do_warmup` to initialize EMA and variance state.
-    3. Run `do_active` to process the active segment and return the final tick's z-score bins.
+
+* **Initialization:** Calls `ExecutionPlanner` to get `assembled_ticks` and `execution_plan`.
+* **Shared Buffer:** Places `assembled_ticks` into `multiprocessing.shared_memory` and exposes it as NumPy views inside workers.
+* **Execution Loop:** Iterates through the plan chronologically:
+  1. Split the current entry into `warmup_part` and `active_part`.
+  2. Run `run_warmup()` to initialize EMA/variance state.
+  3. Run `run_passive_segment()` on regular segments to update `stats`.
+  4. Run `run_capture_segment()` on the final segment and pass the result to `visualize()`.
 
 ### Current State
-* The multiprocessing structure is in place, but current runs are still minimal (`range(1)`).
-* Every worker currently iterates over the full `execution_plan`.
-* Shared memory is used so the assembled tick buffer is not copied into each worker process.
 
-### Guarantees
-* All workers read from the same assembled tick buffer.
-* Warmup and active processing follow the execution plan emitted by the execution planner.
-* Shared memory is explicitly closed and unlinked during cleanup.
+* Execution is currently single-threaded (`run_ids = range(1)`, `BACKTEST_WORKERS = 1`).
+* Shared memory is already integrated, but current runs do not yet benefit from real parallel execution.
+* The `stats` matrix is worker-local.
 
 ---
 
-## 5. Segment Math (`segment_math.py`)
 
-**Goal:** Run warmup and active calculations for each execution segment.
+## 5. Segment Processing (`simulation/passive.py`, `simulation/capture.py`)
 
-### Logic
-* **`do_warmup`**: Initialize EMA and variance state from the warmup segment.
-* **`do_active`**: Process the active segment tick-by-tick, update rolling state, and return discretized z-score bins for the final tick only.
+**Goal:** Run per-segment math in two modes: statistics accumulation and capture for rendering.
 
-### Implementation
-* Core math is compiled with Numba (`njit`).
-* EMA and variance are updated tick-by-tick.
-* Z-scores are scaled and shifted into a fixed integer range (`0-60`).
+Both modules follow the same sequential tick-processing model and are compiled with Numba (`@njit(fastmath=True)`).
 
-### Rules
-* Ticks must be processed in chronological order.
-* Warmup must run before active evaluation.
+### Core Logic
+
+* tick-by-tick processing in chronological order
+* warmup-based initialization of EMA and variance state
+* Z-score calculation and discretization
+* ring-buffer state for delayed price references across configured time horizons
+
+### Passive Mode (`passive.py`)
+
+* `run_warmup()` initializes EMA and variance state from the warmup segment.
+* `run_passive_segment()` processes the active segment tick by tick.
+* Updates the 4D `stats` matrix (`stats[z1, z2, z3, z4]`) with EMA-based deltas and counts across configured time bins.
+* Produces no frame data and performs no rendering-related work.
+
+### Capture Mode (`capture.py`)
+
+* Reuses the same warmup and sequential update flow as the passive path.
+* Maintains a decaying 2D weight matrix during active processing.
+* Maps signal state into Y-axis coordinates derived from EMA-based movement.
+* Captures `video_frames` and `frame_meta` at fixed intervals for later rendering.
+
+### Notes
+
+* `capture.py` is the heavier rendering-oriented path.
+* `passive.py` is the reduced non-rendering path used to build statistics before capture.
 
 ---
 
-## Planned
-- Writing results to the shared `stats` array
+## 6. Visualization (`visualization/visualize.py`)
+
+**Goal:** Render captured matrices into MP4 heatmaps.
+
+### Mechanics
+
+* Normalizes each frame by the column-wise sum of weights.
+* Applies a power transform (`** 0.2`) to the normalized frame.
+* Resizes the result and maps it with OpenCV `COLORMAP_TURBO`.
+* Draws axes, timestamp, legend, reference lines, and realized price path.
+* Exports the rendered frames as an MP4 video.
+
+---
+**Planned:**
 - Core math optimization
