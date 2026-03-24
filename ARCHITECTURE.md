@@ -1,8 +1,8 @@
 # Pipeline Architecture
 
-This document describes the internal mechanics of the data preparation and execution pipeline.
+This document describes the internal mechanics of the preprocessing, planning, and simulation pipeline.
 
-The system transforms raw, unordered CSV dumps into a compact binary format and executes deterministic, gap-aware simulations over assembled tick data. Data preparation and planning modules reside in the `pipeline/` directory, simulation logic in `simulation/`, and rendering logic in `visualization/`.
+The system transforms raw, unordered CSV dumps into a compact binary format and executes deterministic simulations over valid data segments, with missing ranges handled explicitly. Data preparation and planning modules reside in the `pipeline/` directory, simulation logic in `simulation/`, and rendering logic in `visualization/`.
 
 ## 1. Sorter (`pipeline/sorter.py`)
 
@@ -20,16 +20,16 @@ That breaks sequential processing and rolling logic.
 
 ## 2. Binary Packer (`pipeline/binary_packer.py`)
 
-**Goal:** Convert sorted rows into a compact, sequential binary stream with explicit gap metadata.
+**Goal:** Convert sorted rows into a compact, sequential binary stream with explicit missing-range metadata.
 
 **Mechanics:**
 - **Normalization:** Converts source timestamps to a strict 1-second timeline
 - **Month Expansion:** Expands each month to its full second range
 - **Binary Packing:** Packs per-second values into bytes via `struct` (e.g. `<i>`)
-- **Gap Detection:** Missing ranges exceeding a threshold (e.g., `GAP_THRESHOLD_SEC = 15`) are stored as gap metadata (`[gap_start, gap_end]`) in the file
+- **Missing-Range Detection:** Missing ranges exceeding a threshold (e.g. `GAP_THRESHOLD_SEC = 15`) are stored as metadata (`[gap_start, gap_end]`) in the file
 - **Header Write:** Prepends a fixed-size binary header with file metadata
 
-**Important:** The packer keeps a full per-second timeline. Micro-gaps (under 15s) are forward-filled with the last known price, while significant dropouts are explicitly recorded as metadata so downstream logic can accurately distinguish `VALID` vs `INVALID` ranges.
+**Important:** The packer keeps a full per-second timeline. Micro-gaps (under 15s) are forward-filled with the last known price, while significant dropouts are explicitly recorded as metadata so downstream logic can distinguish `VALID` vs `INVALID` ranges.
 
 ### Binary layout (current)
 1. **Header** (64 bytes)
@@ -37,6 +37,7 @@ That breaks sequential processing and rolling logic.
 3. **Packed per-second values**
 
 ### Header metadata (current)
+Current header fields include:
 - signature
 - version
 - start timestamp
@@ -55,28 +56,28 @@ That breaks sequential processing and rolling logic.
 
 ### The Core Problem: Files vs. Timeline
 
-Data is stored in separate `.bin` files, but rolling logic needs a continuous timeline.  
+Data is stored in separate `.bin` files, but rolling logic needs a continuous timeline.
 
-The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to physical file offsets with warmup-aware boundaries.
+The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to physical file offsets while preserving warmup boundaries.
 
-
-It skips `INVALID` gaps, using them to trigger warmup resets for the next `VALID` segment, and emits execution entries in the form:
+It skips `INVALID` ranges, uses them to trigger warmup resets for the next `VALID` segment, and emits execution entries in the form:
 
 `[cursor, timestamp, warmup_ticks, active_ticks]`
 
 ### Input
 
-From each `.bin` file:
+A collection of `.bin` files. For each file, the planner consumes:
 
-* Time bounds from the binary header
-* Gap metadata describing `INVALID` ranges
+* **Header metadata:** file-level metadata such as time bounds, version, symbol, etc.
+* **Gap metadata:** explicit `[start, end]` pairs marking `INVALID` ranges
+* **Tick data:** the packed per-second binary payload
 
 ### Output
 
 The execution planner returns two values:
 
-* **`assembled_ticks`**: a contiguous `int32` NumPy array with the valid tick data required for execution
-* **`execution_plan`**: a list of entries in this format:
+* **`assembled_ticks`**: a contiguous `int32` NumPy array containing the valid tick data required for execution
+* **`execution_plan`**: a list of entries in this format:  
   `[cursor, timestamp, warmup_ticks, active_ticks]`
 
 Each execution-plan entry refers to a slice of the assembled tick buffer.
@@ -84,7 +85,7 @@ Each execution-plan entry refers to a slice of the assembled tick buffer.
 ### Execution Flow
 
 1. **File Scan:** Read binary headers and gap metadata from eligible `.bin` files.
-2. **Timeline Fragmentation:** Convert file-local gaps into `VALID` / `INVALID` timeline segments.
+2. **Timeline Fragmentation:** Convert file-local missing ranges into `VALID` / `INVALID` timeline segments.
 3. **Segment Coalescing:** Merge adjacent segments of the same type.
 4. **File Alignment:** Convert file spans into relative tick intervals within the global timeline.
 5. **Segment Mapping:** Resolve warmup and active coverage against physical file boundaries.
@@ -95,8 +96,8 @@ Each execution-plan entry refers to a slice of the assembled tick buffer.
 
 A global volume check confirms that:
 
-* all valid ticks are either assigned to execution or counted as lost warmup coverage,
-* the assembled payload volume matches the mapped timeline.
+* all valid ticks are either assigned to execution or excluded due to missing warmup coverage
+* the assembled payload volume matches the mapped timeline
 
 ### Guarantees
 
@@ -129,7 +130,6 @@ The runner takes `assembled_ticks` and `execution_plan` from the `ExecutionPlann
 * The `stats` matrix is worker-local.
 
 ---
-
 
 ## 5. Segment Processing (`simulation/passive.py`, `simulation/capture.py`)
 
@@ -178,5 +178,7 @@ Both modules follow the same sequential tick-processing model and are compiled w
 * Exports the rendered frames as an MP4 video.
 
 ---
-**Planned:**
+
+## Planned
+
 - Core math optimization
