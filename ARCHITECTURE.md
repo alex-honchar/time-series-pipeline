@@ -1,43 +1,39 @@
 # Pipeline Architecture
 
-This document describes the internal mechanics of the preprocessing, planning, and simulation pipeline.
+This file explains how the project works internally.
 
-The system transforms raw, unordered CSV dumps into a compact binary format and executes deterministic simulations over valid data segments, with missing ranges handled explicitly. Data preparation and planning modules reside in the `pipeline/` directory, simulation logic in `simulation/`, and rendering logic in `visualization/`.
+The pipeline starts from raw CSV trade dumps, sorts them, packs them into a custom binary format, reconstructs valid and invalid ranges from metadata, and runs simulation on the valid parts.
+
+The code is split into three main areas:
+
+- `pipeline/` for preprocessing, binary packing, and execution planning
+- `simulation/` for warmup, replay, statistics, and capture
+- `visualization/` for rendering captured output
 
 ## 1. Sorter (`pipeline/sorter.py`)
 
-**Goal:** Guarantee a strictly chronological timeline before binary packing.
+The sorter exists because raw exchange dumps are not always strictly chronological.
 
-Exchange dumps (including Binance monthly CSVs) may contain out-of-order rows.  
-That breaks sequential processing and rolling logic.
-
-**Mechanics:**
-- Reads raw CSVs with `pandas`
-- Sorts rows by timestamp column
-- Writes clean sorted CSVs (headerless) for the packer
-
----
+It reads raw CSV files with `pandas`, sorts rows by timestamp, and writes clean headerless CSVs for the binary packer.
 
 ## 2. Binary Packer (`pipeline/binary_packer.py`)
 
-**Goal:** Convert sorted rows into a compact, sequential binary stream with explicit missing-range metadata.
+The binary packer converts sorted rows into a compact monthly binary format with explicit missing-range metadata.
 
-**Mechanics:**
-- **Normalization:** Converts source timestamps to a strict 1-second timeline
-- **Month Expansion:** Expands each month to its full second range
-- **Binary Packing:** Packs per-second values into bytes via `struct` (e.g. `<i>`)
-- **Missing-Range Detection:** Missing ranges exceeding a threshold (e.g. `GAP_THRESHOLD_SEC = 15`) are stored as metadata (`[gap_start, gap_end]`) in the file
-- **Header Write:** Prepends a fixed-size binary header with file metadata
+It normalizes source timestamps to a strict 1-second timeline, expands each month to its full second range, packs per-second values with `struct`, and stores larger missing ranges as metadata inside the file.
 
-**Important:** The packer keeps a full per-second timeline. Micro-gaps (under 15s) are forward-filled with the last known price, while significant dropouts are explicitly recorded as metadata so downstream logic can distinguish `VALID` vs `INVALID` ranges.
+Small gaps (under 15 seconds) are forward-filled with the last known price. Larger gaps are kept explicit so later stages can distinguish `VALID` and `INVALID` ranges.
 
 ### Binary layout (current)
-1. **Header** (64 bytes)
-2. **Gap metadata** (`gap_count × <II>`)
-3. **Packed per-second values**
+
+1. Header (64 bytes)
+2. Gap metadata (`gap_count × <II>`)
+3. Packed per-second values
 
 ### Header metadata (current)
+
 Current header fields include:
+
 - signature
 - version
 - start timestamp
@@ -52,23 +48,17 @@ Current header fields include:
 
 ## 3. Execution Planner (`pipeline/execution_planner.py`)
 
-**Goal:** Assemble a contiguous buffer of valid tick data and an execution plan from fragmented binary files.
+The execution planner builds a contiguous buffer of valid tick data and an execution plan from fragmented binary files.
 
-### The Core Problem: Files vs. Timeline
-
-Data is stored in separate `.bin` files, but rolling logic needs a continuous timeline.
-
-The execution planner reconstructs the global `VALID` / `INVALID` timeline from file metadata and maps it back to physical file offsets while preserving warmup boundaries.
-
-It skips `INVALID` ranges, uses them to trigger warmup resets for the next `VALID` segment, and emits execution entries in the form:
+The main issue here is that data is stored in separate `.bin` files, while the replay logic needs a continuous timeline. The planner reconstructs valid and invalid ranges from file metadata, maps them back to physical file offsets, applies warmup boundaries, and emits entries in the form:
 
 `[cursor, timestamp, warmup_ticks, active_ticks]`
 
 ### Input
 
-A collection of `.bin` files. For each file, the planner consumes:
+A collection of `.bin` files. For each file, the planner uses:
 
-* **Header metadata:** file-level metadata such as time bounds, version, symbol, etc.
+* **Header metadata:** file-level metadata such as time bounds, version, and symbol
 * **Gap metadata:** explicit `[start, end]` pairs marking `INVALID` ranges
 * **Tick data:** the packed per-second binary payload
 
@@ -82,15 +72,15 @@ The execution planner returns two values:
 
 Each execution-plan entry refers to a slice of the assembled tick buffer.
 
-### Execution Flow
+### Execution flow
 
-1. **File Scan:** Read binary headers and gap metadata from eligible `.bin` files.
-2. **Timeline Fragmentation:** Convert file-local missing ranges into `VALID` / `INVALID` timeline segments.
-3. **Segment Coalescing:** Merge adjacent segments of the same type.
-4. **File Alignment:** Convert file spans into relative tick intervals within the global timeline.
-5. **Segment Mapping:** Resolve warmup and active coverage against physical file boundaries.
-6. **Validation:** Check that mapped volume matches expected valid coverage.
-7. **Payload Assembly:** Read the required tick ranges into one contiguous array and build the execution plan.
+1. **File scan:** read binary headers and gap metadata from eligible `.bin` files
+2. **Timeline fragmentation:** convert file-local missing ranges into `VALID` / `INVALID` timeline segments
+3. **Segment coalescing:** merge adjacent segments of the same type
+4. **File alignment:** convert file spans into relative tick intervals within the global timeline
+5. **Segment mapping:** resolve warmup and active coverage against physical file boundaries
+6. **Validation:** check that mapped volume matches expected valid coverage
+7. **Payload assembly:** read the required tick ranges into one contiguous array and build the execution plan
 
 ### Validation
 
@@ -101,84 +91,58 @@ A global volume check confirms that:
 
 ### Guarantees
 
-* No active segment is emitted without contiguous warmup history
-* Warmup resets after invalid timeline gaps
-* Output is deterministic for the same binary input set
+* no active segment is emitted without contiguous warmup history
+* warmup resets after invalid timeline gaps
+* output is deterministic for the same binary input set
 
 ---
 
 ## 4. Backtest Runner (`simulation/backtest_runner.py`)
 
-**Goal:** Execute the assembled tick buffer over the execution plan.
+The backtest runner takes `assembled_ticks` and `execution_plan` from the `ExecutionPlanner`, restores warmup state for each segment, updates the main `stats` structure, and runs capture/rendering on the final segment.
 
-The runner takes `assembled_ticks` and `execution_plan` from the `ExecutionPlanner`, restores warmup state for each segment, updates the stats across the plan, and runs capture/rendering on the final segment.
+### Notes
 
-### Mechanics
-
-* **Initialization:** Calls `ExecutionPlanner` to get `assembled_ticks` and `execution_plan`.
-* **Shared Buffer:** Places `assembled_ticks` into `multiprocessing.shared_memory` and exposes it as NumPy views inside workers.
-* **Execution Loop:** Iterates through the plan chronologically:
-  1. Split the current entry into `warmup_part` and `active_part`.
-  2. Run `run_warmup()` to initialize EMA/variance state.
-  3. Run `run_passive_segment()` on regular segments to update `stats`.
-  4. Run `run_capture_segment()` on the final segment and pass the result to `visualize()`.
-
-### Current State
-
-* Execution is currently single-threaded (`run_ids = range(1)`, `BACKTEST_WORKERS = 1`).
-* Shared memory is already integrated, but current runs do not yet benefit from real parallel execution.
-* The `stats` matrix is worker-local.
+* execution is currently single-threaded (`run_ids = range(1)`, `BACKTEST_WORKERS = 1`)
+* shared memory is already integrated, but current runs do not yet benefit from real parallel execution
+* the `stats` matrix is worker-local
 
 ---
 
 ## 5. Segment Processing (`simulation/passive.py`, `simulation/capture.py`)
 
-**Goal:** Run per-segment math in two modes: statistics accumulation and capture for rendering.
+The segment-processing layer runs in two modes: statistics accumulation and capture for rendering.
 
-Both modules follow the same sequential tick-processing model and are compiled with Numba (`@njit(fastmath=True)`).
-
-### Core Logic
+### Core logic
 
 * tick-by-tick processing in chronological order
 * warmup-based initialization of EMA and variance state
 * Z-score calculation and discretization
 * ring-buffer state for delayed price references across configured time horizons
 
-### Passive Mode (`passive.py`)
+### Passive mode (`passive.py`)
 
-* `run_warmup()` initializes EMA and variance state from the warmup segment.
-* `run_passive_segment()` processes the active segment tick by tick.
-* Updates the 4D `stats` matrix (`stats[z1, z2, z3, z4]`) with EMA-based deltas and counts across configured time bins.
-* Produces no frame data and performs no rendering-related work.
+* `run_warmup()` initializes EMA and variance state from the warmup segment
+* `run_passive_segment()` processes the active segment tick by tick
+* updates the 4D `stats` matrix (`stats[z1, z2, z3, z4]`) with EMA-based deltas and counts across configured time bins
+* produces no frame data and performs no rendering-related work
 
-### Capture Mode (`capture.py`)
+### Capture mode (`capture.py`)
 
-* Reuses the same warmup and sequential update flow as the passive path.
-* Maintains a decaying 2D weight matrix during active processing.
-* Maps signal state into Y-axis coordinates derived from EMA-based movement.
-* Captures `video_frames` and `frame_meta` at fixed intervals for later rendering.
+* reuses the same warmup and sequential update flow as the passive path
+* maintains a decaying 2D weight matrix during active processing
+* maps signal state into Y-axis coordinates derived from EMA-based movement
+* captures `video_frames` and `frame_meta` at fixed intervals for later rendering
 
 ### Notes
 
-* `capture.py` is the heavier rendering-oriented path.
-* `passive.py` is the reduced non-rendering path used to build statistics before capture.
+* `capture.py` is the heavier rendering-oriented path
+* `passive.py` is the reduced non-rendering path used to build statistics before capture
 
 ---
 
 ## 6. Visualization (`visualization/visualize.py`)
 
-**Goal:** Render captured matrices into MP4 heatmaps.
+The visualization layer renders captured matrices as MP4 heatmaps.
 
-### Mechanics
-
-* Normalizes each frame by the column-wise sum of weights.
-* Applies a power transform (`** 0.2`) to the normalized frame.
-* Resizes the result and maps it with OpenCV `COLORMAP_TURBO`.
-* Draws axes, timestamp, legend, reference lines, and realized price path.
-* Exports the rendered frames as an MP4 video.
-
----
-
-## Planned
-
-- Core math optimization
+For each frame it normalizes the matrix by column-wise weight, applies a power transform, resizes the result, maps it with OpenCV `COLORMAP_TURBO`, and overlays axes, timestamps, reference lines, and the realized price path.

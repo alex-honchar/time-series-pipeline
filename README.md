@@ -1,89 +1,55 @@
-# Deterministic Time-Series Backtesting Engine
+# Time-Series Data Pipeline and Simulation Project
 
-A Python backtesting engine for deterministic simulation of time-series data.
+This is a Python project that takes raw aggTrades data, packs it into a custom binary format, and runs simulation on top of that data.
 
-The system converts raw CSV dumps into a custom binary format, builds an execution plan over contiguous valid data segments, and runs sequential simulation. The final stage renders captured 2D state matrices as dynamic MP4 heatmaps.
+I started this project as a practical way to learn programming more seriously. I chose Binance market data mainly because it was freely available, while the real goal was to build something larger than small exercises or toy scripts.
 
-Detailed module breakdown and data flow: see `ARCHITECTURE.md`.
+At the beginning, I barely knew Python. I used the project as a way to learn by doing: working through raw data, project structure, simulation logic, and performance questions in one codebase.
 
----
+The repository is split into three parts:
 
-## Pipeline Structure
+- `pipeline/` — preprocessing, binary packing, execution planning
+- `simulation/` — warmup, replay, statistics, capture
+- `visualization/` — rendering simulation output as MP4 heatmaps
 
-Data preparation and planning modules reside in `pipeline/`, simulation logic in `simulation/`, and rendering logic in `visualization/`.
+## What it does
 
-### 1) Preprocessing (`pipeline/sorter.py`)
-Sorts raw source CSVs by timestamp.
+The current pipeline:
 
-This step exists because exchange dumps (e.g. Binance monthly CSVs) may contain rows that are out of chronological order.
+- sorts raw CSV data by timestamp
+- packs the data into a custom monthly binary format
+- keeps missing ranges explicit in metadata
+- assembles valid data into replayable segments
+- runs simulation over those segments
+- renders one part of the captured output as MP4 heatmaps
 
-### 2) Binary Packer (`pipeline/binary_packer.py`)
-Converts raw time-series rows into a custom monthly binary format.
+## Performance
 
-The packer:
-- normalizes input into a strict 1-second timeline
-- expands each month to its full second range
-- stores missing ranges explicitly in metadata
+**Test machine:** `Ryzen 7 5800X` (single-threaded), `DDR4-3400`
 
-### 3) Execution Planner (`pipeline/execution_planner.py`)
-Builds a contiguous tick buffer and an execution plan over valid data segments.
+| Configuration | Throughput | Ticks / s |
+| :--- | :--- | :--- |
+| **Engine** | **236 years/s** | **~7.5B** |
+| **Engine + Simulation** | **1.2 years/s** | **~39M** |
 
-It uses missing ranges to split the timeline into valid segments, resets warmup before each new segment, and emits execution entries in the form:
+The **Engine** result reflects the engine by itself, with minimal per-tick math.
 
-`[cursor, timestamp, warmup_ticks, active_ticks]`
+### Why simulation is slower
 
-### 4) Backtest Runner (`simulation/backtest_runner.py`)
-Executes the generated plan over the assembled tick buffer.
+The simulation I've built on top is still heavy. The main bottleneck is memory access: every tick updates a large 4D array, while EMA, variance state, and Z-score updates add extra work on top.
 
-- restores warmup state for each segment
-- updates `stats` across the execution plan
-- routes the final segment through capture and rendering
-- uses `multiprocessing.shared_memory` for the assembled tick buffer
+## Data
 
-### 5) Segment Processing (`simulation/passive.py`, `simulation/capture.py`)
-Runs the core per-segment math.
+Current setup:
 
-- **Passive mode:** updates the 4D `stats` matrix without rendering overhead
-- **Capture mode:** reuses the same sequential processing flow, adds weight-matrix updates, and records frame data for rendering
-- **Math:** uses Numba-compiled functions for warmup, EMA / variance updates, Z-score discretization, and ring-buffer-based delayed price tracking
+- Binance BTCUSDT aggTrades
+- internal resolution: 1 second
+- dataset is stored locally and not included in the repository
 
-### 6) Visualization (`visualization/visualize.py`)
-Renders captured 2D matrices into MP4 heatmaps.
+## Tech stack
 
-- normalizes captured 2D matrices
-- resizes them into a fixed video canvas
-- applies OpenCV color mapping
-- draws axes, timestamps, and realized price paths
-- writes the result as an MP4 file
+Python 3.x, NumPy, Numba, pandas, OpenCV, `multiprocessing.shared_memory`, `struct`, `concurrent.futures`
 
----
+## More detail
 
-## Data (Current Setup)
-
-- Binance BTCUSDT trade dumps
-- Internal resolution: 1 second
-- Dataset stored locally and not included in the repository
-
----
-
-## Status
-
-**Implemented:**
-- CSV sorting for chronological preprocessing
-- Binary packing into a custom monthly format
-- Explicit missing-range metadata
-- Execution planning over valid segments with warmup resets
-- Global volume validation
-- Shared-memory tick buffer assembly
-- Passive segment processing with 4D `stats` updates
-- Capture mode with frame recording
-- MP4 heatmap rendering via OpenCV
-
-**Planned:**
-- Core math optimization
-
----
-
-## Tech Stack
-
-Python 3.x, `numpy`, `numba`, `multiprocessing.shared_memory`, `struct`, `concurrent.futures`, `pandas` (preprocessing only), `opencv-python`
+For the internal mechanics and module-level breakdown, see [`ARCHITECTURE.md`](ARCHITECTURE.md). 

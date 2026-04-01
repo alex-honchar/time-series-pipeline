@@ -32,34 +32,37 @@ class Config:
         self.WARMUP = 86400
         self.GAP_THRESHOLD_SEC = 15
 
-        self.Z_SPACE = 51
+        self.Z_SPACE = 61
         self.Z_DUMMY = (self.Z_SPACE - 1)
         self.Z_HALF = (self.Z_SPACE - 1) // 2
         self.ZSCORE_STEP = 2
-        self.MIN_Z_WEIGHT = 10
 
-        self.PRICE_BINS = 201
+        self.MIN_Z_WEIGHT = 12
+        self.MIN_COUNT = 600
+        self.MIN_EMA = 0.0005 # 0.05%
+
+        self.PRICE_BINS = 101
         self.CENTER_BIN = (self.PRICE_BINS - 1) // 2
         self.PRICE_STEP = 10000  # 0.01%
 
-        self.ALPHA_STEPS = 1800
+        self.ALPHA_STEPS = 600
         self.EMA_ALPHA = 1 - 0.5**(1/self.ALPHA_STEPS)
-        self.CAPTURE_INTERVAL = 1800
+        self.CAPTURE_INTERVAL = 3600
 
-        time_zero, time_max = 1800, 86400
+        time_zero, time_max = 86400, 86400
         _time_bins = [int(time_zero)]
         while time_zero <= time_max:
-            time_zero += 1800
+            time_zero += 21600
             if time_zero <= time_max:
                 _time_bins.append(int(time_zero))
 
         self.TIME_BINS = np.asarray(_time_bins, dtype=np.int32)
 
-        self.RETENTION_TARGET = 0.9999
+        self.RETENTION_TARGET = 0.9
         self.HORIZON_PENALTY = 0.1
         _decays = []
         for time_bin in _time_bins:
-            decay = self.RETENTION_TARGET**(1/(time_bin**self.HORIZON_PENALTY))
+            decay = self.RETENTION_TARGET**(1/(time_bin+1e-9**self.HORIZON_PENALTY))
             _decays.append(decay)
         self.DECAYS = np.asarray(_decays, dtype=np.float64)
 

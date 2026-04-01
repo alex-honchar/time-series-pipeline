@@ -14,7 +14,10 @@ CENTER_BIN = cfg.CENTER_BIN
 Z_HALF = cfg.Z_HALF
 Z_DUMMY = cfg.Z_DUMMY
 ZSCORE_STEP = cfg.ZSCORE_STEP
+
 MIN_Z_WEIGHT = cfg.MIN_Z_WEIGHT
+MIN_COUNT = cfg.MIN_COUNT
+MIN_EMA = cfg.MIN_EMA
 
 PRICE_STEP = cfg.PRICE_STEP
 EMA_ALPHA = cfg.EMA_ALPHA
@@ -59,20 +62,26 @@ def run_capture_segment(
     frame_meta = np.zeros(shape=(frames_count,), dtype=TRAPPED_META_DTYPE)
 
     for i in range(active_part.size):
-        tick_timestamp = timestamp + i + WARMUP
         float_price = np.float64(active_part[i])
         log_price = np.log(float_price)
+        tick_timestamp = timestamp + i + WARMUP
 
-        for j in range(windows_count):
-            update_zscore(float_price, emas, variances, zscores, alphas, betas, j)
+        update_zscores(float_price, emas, variances, zscores, alphas, betas)
 
-        for x_coord, time_bin in enumerate(TIME_BINS):
+        for x_coord in range(time_bins_count):
+            time_bin = TIME_BINS[x_coord]
             update_bin_stats(
-                log_price, ring_buffer, rb_cursor, time_bin, rb_size, stats, x_coord
+                log_price,
+                ring_buffer,
+                rb_cursor,
+                time_bin,
+                rb_size,
+                stats,
+                x_coord
             )
 
         z1, z2, z3, z4 = zscores
-        write_key_to_buffer(z1, z2, z3, z4, log_price, ring_buffer, rb_cursor)
+        write_key_to_buffer( z1, z2, z3, z4, log_price, ring_buffer, rb_cursor)
 
         decay_weight_matrix(weight_matrix, DECAYS)
         y_coords = calculate_y_coords(z1, z2, z3, z4, stats)
@@ -102,12 +111,14 @@ def run_capture_segment(
                 meta_number,
             )
 
-        rb_cursor = (rb_cursor + 1) % rb_size
+        rb_cursor += 1
+        if rb_cursor == rb_size:
+            rb_cursor = 0
 
     return video_frames, frame_meta
 
 
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def init_ring_buffer(
     ring_buffer: np.ndarray, rb_size: np.int32, windows_count: np.int64
 ) -> None:
@@ -118,27 +129,65 @@ def init_ring_buffer(
             ring_buffer[buffer_slot].key[key_idx] = Z_DUMMY
 
 
-@nb.njit(fastmath=True, cache=False)
-def update_zscore(
+@nb.njit(fastmath=True, cache=False, inline='always')
+def update_zscores(
     float_price: np.float64,
     emas: np.ndarray,
     variances: np.ndarray,
     zscores: np.ndarray,
     alphas: np.ndarray,
-    betas: np.ndarray,
-    j: np.int32,
+    betas: np.ndarray
 ) -> None:
     """Update EMA and variance, calculate and bin Z-score."""
-    diff = float_price - emas[j]
-    emas[j] += alphas[j] * diff
-    zscore_j = diff / np.sqrt(variances[j] + 1e-9)
-    scaled = np.int32(np.abs(zscore_j) * ZSCORE_STEP)
-    offset = np.int32(np.sign(zscore_j) * np.minimum(Z_HALF, scaled))
-    zscores[j] = Z_HALF + offset
-    variances[j] = betas[j] * variances[j] + alphas[j] * diff * diff
+    diff = float_price - emas[0]
+    emas[0] += alphas[0] * diff
+    zscore = diff / np.sqrt(variances[0] + 1e-9)
+    scaled = np.int32(np.abs(zscore) * ZSCORE_STEP)
+    if scaled > Z_HALF:
+        scaled = Z_HALF
+    if zscore >= 0.0:
+        zscores[0] = Z_HALF + scaled
+    else:
+        zscores[0] = Z_HALF - scaled
+    variances[0] = betas[0] * variances[0] + alphas[0] * diff * diff
 
+    diff = float_price - emas[1]
+    emas[1] += alphas[1] * diff
+    zscore = diff / np.sqrt(variances[1] + 1e-9)
+    scaled = np.int32(np.abs(zscore) * ZSCORE_STEP)
+    if scaled > Z_HALF:
+        scaled = Z_HALF
+    if zscore >= 0.0:
+        zscores[1] = Z_HALF + scaled
+    else:
+        zscores[1] = Z_HALF - scaled
+    variances[1] = betas[1] * variances[1] + alphas[1] * diff * diff
 
-@nb.njit(fastmath=True, cache=False)
+    diff = float_price - emas[2]
+    emas[2] += alphas[2] * diff
+    zscore = diff / np.sqrt(variances[2] + 1e-9)
+    scaled = np.int32(np.abs(zscore) * ZSCORE_STEP)
+    if scaled > Z_HALF:
+        scaled = Z_HALF
+    if zscore >= 0.0:
+        zscores[2] = Z_HALF + scaled
+    else:
+        zscores[2] = Z_HALF - scaled
+    variances[2] = betas[2] * variances[2] + alphas[2] * diff * diff
+
+    diff = float_price - emas[3]
+    emas[3] += alphas[3] * diff
+    zscore = diff / np.sqrt(variances[3] + 1e-9)
+    scaled = np.int32(np.abs(zscore) * ZSCORE_STEP)
+    if scaled > Z_HALF:
+        scaled = Z_HALF
+    if zscore >= 0.0:
+        zscores[3] = Z_HALF + scaled
+    else:
+        zscores[3] = Z_HALF - scaled
+    variances[3] = betas[3] * variances[3] + alphas[3] * diff * diff
+
+@nb.njit(fastmath=True, cache=False, inline='always')
 def update_bin_stats(
     log_price: np.float64,
     ring_buffer: np.ndarray,
@@ -149,18 +198,20 @@ def update_bin_stats(
     x_coord: np.int32,
 ) -> None:
     """Update price-delta for the buffered key at the current time bin."""
-    current_bin = (rb_cursor - time_bin + rb_size) % rb_size
+    current_bin = rb_cursor - time_bin
+    if current_bin < 0:
+        current_bin += rb_size
+
     z1, z2, z3, z4 = ring_buffer[current_bin].key
     past_log = ring_buffer[current_bin].price
 
-    log_diff = log_price - past_log
-    stats[z1, z2, z3, z4].ema[x_coord] += EMA_ALPHA * (
-        (log_diff) - stats[z1, z2, z3, z4].ema[x_coord]
-    )
+    log_diff = log_price-past_log
+    ema = stats[z1, z2, z3, z4].ema[x_coord]
+    stats[z1, z2, z3, z4].ema[x_coord] = ema + EMA_ALPHA * (log_diff - ema)
+
     stats[z1, z2, z3, z4].count[x_coord] += 1
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def write_key_to_buffer(
     z1: np.int32,
     z2: np.int32,
@@ -177,15 +228,13 @@ def write_key_to_buffer(
     ring_buffer[rb_cursor].key[3] = z4
     ring_buffer[rb_cursor].price = log_price
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def decay_weight_matrix(weight_matrix: np.ndarray, decay_array: np.ndarray) -> None:
     """Apply decay to each time-bin row of the frame matrix."""
     for i in range(decay_array.size):
         weight_matrix[i] *= decay_array[i]
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def calculate_y_coords(
     z1: np.int32, z2: np.int32, z3: np.int32, z4: np.int32, stats: np.ndarray
 ) -> np.ndarray:
@@ -199,8 +248,7 @@ def calculate_y_coords(
 
     return y_coords
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def add_weight_to_matrix(
     z_weight: np.int32,
     bin_counts: np.ndarray,
@@ -212,13 +260,12 @@ def add_weight_to_matrix(
     """Add signal weight into the frame matrix."""
     if (
         z_weight >= MIN_Z_WEIGHT
-        and bin_counts[x_coord] >= 20
-        and abs(avg_ema) > 0.0005 # 0.05%
+        and bin_counts[x_coord] >= MIN_COUNT
+        and abs(avg_ema) > MIN_EMA
     ):
         weight_matrix[x_coord, y_coords[x_coord]] += z_weight**1
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def capture_frame(
     weight_matrix: np.ndarray, video_frames: np.ndarray, meta_number: np.int32
 ) -> None:
@@ -227,8 +274,7 @@ def capture_frame(
         for y in range(PRICE_BINS):
             video_frames[meta_number, x, y] = weight_matrix[x, y]
 
-
-@nb.njit(fastmath=True, cache=False)
+@nb.njit(fastmath=True, cache=False, inline='always')
 def capture_frame_meta(
     ring_buffer: np.ndarray,
     rb_cursor: np.int32,

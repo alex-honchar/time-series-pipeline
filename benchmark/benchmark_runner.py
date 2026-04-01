@@ -1,4 +1,4 @@
-"""Launch backtest workers."""
+"""Test speed."""
 
 import concurrent.futures
 import time
@@ -6,12 +6,9 @@ from multiprocessing import shared_memory
 
 import numpy as np
 
+from benchmark.benchmark_sum import test_engine_speed
 from config import Config
 from pipeline.execution_planner import ExecutionPlanner
-from simulation.capture import run_capture_segment
-from simulation.passive import run_passive_segment
-from simulation.warmup import run_warmup
-from visualization.visualize import visualize
 
 cfg = Config()
 
@@ -32,59 +29,36 @@ def init_worker(
     worker_plan = execution_plan
 
 
-def process_segments(_run_id: int, assembled_ticks: np.ndarray) -> None:
-    """Process warmup and active history segments defined by worker instructions."""
+def process_segments(_run_id: int) -> None:
+    """Run numba warmup and test speed."""
     global ticks_view, worker_plan
 
-    windows = np.array([30.0, 125.0, 625.0, 14400.0], dtype=np.float64)
+    repeats = 100
 
-    stats = np.zeros(
-        shape=(cfg.Z_SPACE, cfg.Z_SPACE, cfg.Z_SPACE, cfg.Z_SPACE),
-        dtype=cfg.STATS_DTYPE
-    )
-
-    whole_start = time.perf_counter_ns()
-    total_plans = len(worker_plan)
-    capture_offset = -1
-    to_capture = total_plans - capture_offset
-
-    print(f"segments: {total_plans}, capture segment: {to_capture}")
-
-    for i, (cursor, timestamp, warmup_ticks, active_ticks) in enumerate(worker_plan):
-        warmup_part = ticks_view[cursor : cursor + warmup_ticks]
+    #warmup numba
+    for cursor, _, warmup_ticks, active_ticks in worker_plan:
         active_part = ticks_view[
             cursor + warmup_ticks : cursor + warmup_ticks + active_ticks
         ]
 
-        if i+1 < (total_plans-capture_offset):
-            emas, variances = run_warmup(warmup_part, windows)
-            stats = run_passive_segment(
-                active_part, windows, emas, variances, stats
-            )
-            if (i+1) % 10 == 0:
-                print(f"Passive: {i+1}")
+        test_engine_speed(active_part)
 
-        elif i+1 == (to_capture):
-            emas, variances = run_warmup(warmup_part, windows)
-            print(f"Capture: {i+1}")
-            trapped_matrix, trapped_meta = run_capture_segment(
-                active_part, windows, emas, variances, stats, timestamp
-            )
-            print("Rendering video")
-            visualize(trapped_matrix, trapped_meta)
+    ticks_done = repeats * sum(active_ticks for _, _, _, active_ticks in worker_plan)
+
+    whole_start = time.perf_counter_ns()
+    prices_sum = 0
+
+    for _ in range(repeats):
+        for cursor, _, warmup_ticks, active_ticks in worker_plan:
+            active_part = ticks_view[
+                cursor + warmup_ticks : cursor + warmup_ticks + active_ticks
+            ]
+            prices_sum += test_engine_speed(active_part)
 
     whole_end = time.perf_counter_ns()
-    whole_time = (whole_end-whole_start)/1e9
-    print(f"Speed: {len(assembled_ticks)/whole_time} ticks per sec")
-
-
-def print_engine_specs(assembled_ticks: np.ndarray, execution_plan: list) -> None:
-    """Print run specs."""
-    print(f"ticks loaded: {len(assembled_ticks):,}")
-    print(f"segments: {len(execution_plan)}")
-    print(f"workers: {cfg.BACKTEST_WORKERS}")
-    print(f"matrix: {cfg.TIME_BINS.size} x {cfg.PRICE_BINS}")
-    print(f"z-space: {cfg.Z_SPACE}^4")
+    whole_time = (whole_end - whole_start) / 1e9
+    print(f"Speed: {ticks_done / whole_time} ticks per sec")
+    print(f"Prices sum: {prices_sum}")
 
 def run() -> None:
     """Run the backtest pipeline."""
@@ -92,8 +66,6 @@ def run() -> None:
     try:
         execution_planner = ExecutionPlanner(cfg.FORMATTED_DIR)
         assembled_ticks, execution_plan = execution_planner.build()
-
-        print_engine_specs(assembled_ticks, execution_plan)
 
         shared_mem = shared_memory.SharedMemory(
             create=True, size=assembled_ticks.nbytes
@@ -117,7 +89,7 @@ def run() -> None:
             initargs=(shm_name, shm_shape, shm_dtype, execution_plan),
         ) as executor:
             futures = [
-                executor.submit(process_segments, run_id, assembled_ticks)
+                executor.submit(process_segments, run_id)
                 for run_id in run_ids
             ]
             for future in concurrent.futures.as_completed(futures):

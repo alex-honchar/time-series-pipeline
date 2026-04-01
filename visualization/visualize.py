@@ -20,7 +20,7 @@ OFFSET_X = FULL_X - GRAPH_X
 OFFSET_Y = FULL_Y - GRAPH_Y
 
 TIME_BIN_STEP = 1
-PRICE_BIN_STEP = 4
+PRICE_BIN_STEP = 1
 
 CANVAS_BACKGROUND = 0
 TEXT_COLOR = 255
@@ -156,11 +156,35 @@ def draw_price_meta(
     for i, price in enumerate(vectored_price):
         y_center = GRAPH_Y//2
         step_for_price_bin = GRAPH_Y // cfg.PRICE_BINS
-        step_for_x = GRAPH_X // cfg.TIME_BINS.size
+
+        if cfg.TIME_BINS.size > 1:
+            step_for_x = GRAPH_X // (cfg.TIME_BINS.size - 1)
+        else:
+            step_for_x = GRAPH_X
+
         x_offset = OFFSET_X + (step_for_x*i)
         scaled = price*cfg.PRICE_STEP
         y_offset = np.int32(min(GRAPH_Y, (y_center - scaled * step_for_price_bin)))
         points.append((x_offset, y_offset))
+
+    if len(points) == 1:
+        cv2.line(
+            canvas,
+            (points[0][0], points[0][1]),
+            (points[0][0]+step_for_x, points[0][1]),
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.line(
+            canvas,
+            (points[0][0], points[0][1]),
+            (points[0][0]+step_for_x, points[0][1]),
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return
 
     for i in range(len(points)):
         if i == 0:
